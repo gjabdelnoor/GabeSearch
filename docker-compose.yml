@@ -24,7 +24,9 @@ services:
     command: ["nginx", "-g", "daemon off;"]
 
   bulk-rag:
-    build: ./orchestrator
+    build:
+      context: .
+      dockerfile: Dockerfile
     stdin_open: true
     tty: true
     environment:

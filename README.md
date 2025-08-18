@@ -93,3 +93,13 @@ SearXNG now runs behind a lightweight nginx proxy on port 8888. The proxy inject
 
 Queries randomize typical browser headers and rotate between multiple search engines. If one engine returns no results (for example, due to a CAPTCHA), the tool automatically retries with the next engine.
 
+### Docker build
+
+To create a portable image of the MCP server you can run:
+
+```bash
+docker build . -t gabesearch:latest
+```
+
+This image contains only the bulk search server. Use the provided `docker compose` setup or your own SearXNG instance to handle search requests.
+
