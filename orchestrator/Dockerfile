@@ -11,5 +11,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r requirements.txt
 
-COPY server.py /app/server.py
+COPY server.py config.py search.py vector_cache.py mcp_server.py /app/
 ENTRYPOINT ["python", "/app/server.py"]
