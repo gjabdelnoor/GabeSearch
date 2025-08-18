@@ -21,6 +21,7 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
 - 🐳 **One-click setup** - Containerized with Docker for easy deployment
 - 🔧 **Cross-platform** - Works on Windows, Mac, and Linux
 - 🖥️ **GUI prototype** - Electron-based interface to tweak settings and control services
+- 🧩 **Robust MCP server** - Uses stdio transport and logs to stderr for reliable JSON-RPC communication
 
 
 ## 🚀 Quick Start
