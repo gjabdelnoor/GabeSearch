@@ -87,6 +87,16 @@ WEB_CACHE_TTL_DAYS=10
 
 From the GUI you can also index local documents via the **Upload Files** button, which embeds and stores selected files in the same vector cache for small‑scale RAG.
 
+### Logging
+
+Control verbosity of the orchestrator with the `LOG_LEVEL` environment variable:
+
+```
+LOG_LEVEL=DEBUG  # options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+```
+
+By default the server logs at `INFO` level.
+
 ## 💻 Usage
 
 The tool accepts search queries in JSON format:

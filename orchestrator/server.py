@@ -1,4 +1,4 @@
-import os, re, json, asyncio, aiohttp, httpx, sys
+import os, re, json, asyncio, aiohttp, httpx, sys, logging
 from functools import lru_cache
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -19,6 +19,10 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 WEB_CACHE_COLLECTION = os.getenv("WEB_CACHE_COLLECTION", "web-cache")
 WEB_CACHE_TTL_DAYS = int(os.getenv("WEB_CACHE_TTL_DAYS", "999999"))
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger(__name__)
 
 server = Server("gabesearch-mcp")
 
@@ -85,7 +89,7 @@ async def vector_search(q: str, k: int = 12):
             })
         return hits
     except Exception as e:
-        print(f"Vector search error: {e}", file=sys.stderr, flush=True)
+        logger.error("Vector search error: %s", e)
         return []
 
 def parse_queries_from_prompt(prompt: str):
@@ -161,22 +165,22 @@ async def searx_top_links(query: str, k: int):
     async with aiohttp.ClientSession(headers=headers) as s:
         params = {"q": query, "format": "json", "categories": "general"}
         try:
-            print(f"DEBUG: Searching for '{query}'...", file=sys.stderr, flush=True)
+            logger.debug("Searching for '%s'...", query)
             async with s.get(SEARX_URL, params=params, timeout=15) as r:
-                print(f"DEBUG: Status {r.status}, Content-Type: {r.headers.get('content-type')}", file=sys.stderr, flush=True)
+                logger.debug("Status %s, Content-Type: %s", r.status, r.headers.get('content-type'))
                 
                 # Check if we got HTML instead of JSON (bot detection triggered)
                 content_type = r.headers.get('content-type', '')
                 if 'text/html' in content_type:
-                    print(f"DEBUG: SearxNG returned HTML (bot detection) for query '{query}'", file=sys.stderr, flush=True)
+                    logger.debug("SearxNG returned HTML (bot detection) for query '%s'", query)
                     html_content = await r.text()
-                    print(f"DEBUG: HTML preview: {html_content[:300]}...", file=sys.stderr, flush=True)
+                    logger.debug("HTML preview: %s...", html_content[:300])
                     return []
                 
                 # Parse JSON response
                 data = await r.json()
                 results_found = len(data.get("results", []))
-                print(f"DEBUG: Found {results_found} results for '{query}'", file=sys.stderr, flush=True)
+                logger.debug("Found %s results for '%s'", results_found, query)
                 
                 out = []
                 for item in data.get("results", [])[:k]:
@@ -193,13 +197,13 @@ async def searx_top_links(query: str, k: int):
                 return out
                 
         except aiohttp.ClientError as e:
-            print(f"Network error for query '{query}': {e}", file=sys.stderr, flush=True)
+            logger.error("Network error for query '%s': %s", query, e)
             return []
         except json.JSONDecodeError as e:
-            print(f"JSON decode error for query '{query}': {e}", file=sys.stderr, flush=True)
+            logger.error("JSON decode error for query '%s': %s", query, e)
             return []
         except Exception as e:
-            print(f"Unexpected error for query '{query}': {e}", file=sys.stderr, flush=True)
+            logger.error("Unexpected error for query '%s': %s", query, e)
             return []
 
 def extract_page_metadata(html: str, url: str):
@@ -279,13 +283,13 @@ async def fetch_page_with_metadata(url: str, client: httpx.AsyncClient):
             
             return clean_text[:PER_PAGE_CHARS], metadata
     except Exception as e:
-        print(f"Fetch error for {url}: {e}", file=sys.stderr, flush=True)
+        logger.error("Fetch error for %s: %s", url, e)
     
     return "", {}
 
 async def bulk_retrieve(prompt: str):
     queries, claim = parse_queries_from_prompt(prompt)
-    print(f"DEBUG: Parsed {len(queries)} queries: {queries}", file=sys.stderr, flush=True)
+    logger.debug("Parsed %s queries: %s", len(queries), queries)
     
     # Search all queries in parallel
     search_tasks = [searx_top_links(q, TOP_K) for q in queries]
@@ -294,12 +298,12 @@ async def bulk_retrieve(prompt: str):
     # Flatten results but keep query association
     flat_links = []
     for q, results in zip(queries, search_results):
-        print(f"DEBUG: Query '{q}' returned {len(results)} results", file=sys.stderr, flush=True)
+        logger.debug("Query '%s' returned %s results", q, len(results))
         for item in results:
             item["source_query"] = q
             flat_links.append(item)
     
-    print(f"DEBUG: Total {len(flat_links)} links to fetch", file=sys.stderr, flush=True)
+    logger.debug("Total %s links to fetch", len(flat_links))
     
     # Fetch all pages in parallel
     sources = []
@@ -357,7 +361,7 @@ async def bulk_retrieve(prompt: str):
                             if pts:
                                 qc.upsert(WEB_CACHE_COLLECTION, points=pts)
                     except Exception as e:
-                        print(f"Vector cache error for {item['url']}: {e}", file=sys.stderr, flush=True)
+                        logger.error("Vector cache error for %s: %s", item['url'], e)
 
                     # Create rich source metadata for citations
                     source = {
@@ -389,7 +393,7 @@ async def bulk_retrieve(prompt: str):
                     if used_chars >= TOTAL_CHARS:
                         break
 
-    print(f"DEBUG: Successfully fetched {len(sources)} sources, {used_chars} chars", file=sys.stderr, flush=True)
+    logger.debug("Successfully fetched %s sources, %s chars", len(sources), used_chars)
 
     vec_hits = await vector_search(claim or " ".join(queries), k=TOP_K * 2)
     seen = set(u["url"] for u in sources)
@@ -452,8 +456,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except* (asyncio.CancelledError, BrokenPipeError):
         pass
-    except* Exception as eg:
-        import traceback
-        print("FATAL ExceptionGroup:", file=sys.stderr, flush=True)
-        traceback.print_exception(eg, file=sys.stderr)
+    except* Exception:
+        logger.exception("FATAL ExceptionGroup")
         sys.exit(1)
