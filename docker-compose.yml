@@ -23,7 +23,7 @@ services:
       - ./nginx:/etc/nginx/conf.d:ro
     command: ["nginx", "-g", "daemon off;"]
 
-  bulk-rag:
+  gabesearch-mcp:
     build:
       context: .
       dockerfile: Dockerfile

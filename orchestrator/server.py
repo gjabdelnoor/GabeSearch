@@ -36,7 +36,7 @@ def _random_headers():
         "Cache-Control": "no-cache",
     }
 
-server = Server("bulk-rag")
+server = Server("GabeSearch-mcp")
 
 def parse_queries_from_prompt(prompt: str):
     """Extract queries from JSON or structured text"""
@@ -241,7 +241,7 @@ async def bulk_retrieve(prompt: str):
     used_chars = 0
     
     if flat_links:
-        async with httpx.AsyncClient(headers={"User-Agent": "bulk-rag/0.1"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent": "GabeSearch-mcp/0.1"}) as client:
             tasks = [fetch_page_with_metadata(item["url"], client) for item in flat_links]
             pages = await asyncio.gather(*tasks)
             

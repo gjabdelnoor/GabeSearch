@@ -98,8 +98,8 @@ Queries randomize typical browser headers and rotate between multiple search eng
 To create a portable image of the MCP server you can run:
 
 ```bash
-docker build . -t gabesearch:latest
+docker build . -t gabesearch-mcp:latest
 ```
 
-This image contains only the bulk search server. Use the provided `docker compose` setup or your own SearXNG instance to handle search requests.
+This image contains only the GabeSearch MCP server. Use the provided `docker compose` setup or your own SearXNG instance to handle search requests.
 
