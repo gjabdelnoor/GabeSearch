@@ -1,4 +1,5 @@
-import os, re, json, asyncio, aiohttp, httpx
+import os, re, json, asyncio, aiohttp, httpx, sys
+from functools import lru_cache
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse
@@ -6,7 +7,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 from FlagEmbedding import BGEM3FlagModel
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.transport.stdio import stdio_transport
 from mcp.types import Tool, TextContent
 
 SEARX_URL = os.getenv("SEARX_URL", "http://localhost:8888/search")
@@ -17,35 +18,37 @@ TOTAL_CHARS = int(os.getenv("TOTAL_CHARS", "100000"))
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 WEB_CACHE_COLLECTION = os.getenv("WEB_CACHE_COLLECTION", "web-cache")
-WEB_CACHE_TTL_DAYS = int(os.getenv("WEB_CACHE_TTL_DAYS", "10"))
+WEB_CACHE_TTL_DAYS = int(os.getenv("WEB_CACHE_TTL_DAYS", "999999"))
 
 server = Server("gabesearch-mcp")
 
-_qc = None
-_embed = None
 
-
+@lru_cache(maxsize=1)
 def get_qdrant():
-    global _qc
-    if _qc is None:
-        _qc = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-        try:
-            _qc.get_collection(WEB_CACHE_COLLECTION)
-        except Exception:
-            _qc.recreate_collection(
-                collection_name=WEB_CACHE_COLLECTION,
-                vectors=qm.VectorParams(size=1024, distance=qm.Distance.COSINE),
-                optimizers_config=qm.OptimizersConfigDiff(indexing_threshold=20000),
-            )
-            _qc.create_payload_index(WEB_CACHE_COLLECTION, field_name="url", field_schema="keyword")
-    return _qc
+    qc = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    try:
+        qc.get_collection(WEB_CACHE_COLLECTION)
+    except Exception:
+        qc.recreate_collection(
+            collection_name=WEB_CACHE_COLLECTION,
+            vectors=qm.VectorParams(size=1024, distance=qm.Distance.COSINE),
+            optimizers_config=qm.OptimizersConfigDiff(indexing_threshold=20000),
+        )
+        qc.create_payload_index(WEB_CACHE_COLLECTION, field_name="url", field_schema="keyword")
+    return qc
 
 
+@lru_cache(maxsize=1)
 def get_embed():
-    global _embed
-    if _embed is None:
-        _embed = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
-    return _embed
+    import torch
+
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+        if torch.version.hip is not None and os.name == "nt":
+            # Enable Windows ROCm on RX 6800 XT (gfx1030)
+            os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+    return BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device=device)
 
 
 def chunk_text(txt: str, size=1000, overlap=120):
@@ -82,7 +85,7 @@ async def vector_search(q: str, k: int = 12):
             })
         return hits
     except Exception as e:
-        print(f"Vector search error: {e}", flush=True)
+        print(f"Vector search error: {e}", file=sys.stderr, flush=True)
         return []
 
 def parse_queries_from_prompt(prompt: str):
@@ -91,7 +94,7 @@ def parse_queries_from_prompt(prompt: str):
         # Try JSON format first
         data = json.loads(prompt)
         if "queries" in data:
-            return data["queries"][:5], data.get("claim", prompt)
+            return data["queries"][:N_QUERIES], data.get("claim", prompt)
     except json.JSONDecodeError:
         pass
     
@@ -111,10 +114,10 @@ def parse_queries_from_prompt(prompt: str):
                 if query:
                     queries.append(query)
         
-        return queries[:5], claim
+        return queries[:N_QUERIES], claim
     
     # Fallback: generate queries from prompt
-    return simple_queries(prompt, 3), prompt
+    return simple_queries(prompt, N_QUERIES), prompt
 
 def simple_queries(prompt: str, n: int):
     """Fallback query generation"""
@@ -135,7 +138,10 @@ def simple_queries(prompt: str, n: int):
         actual_claim = prompt[:200]
     
     words = [w for w in actual_claim.lower().split() if len(w) > 3][:10]
-    return [" ".join(words)][:n]
+    base = " ".join(words)
+    if not base:
+        base = actual_claim[:200]
+    return [base] * max(1, n)
 
 async def searx_top_links(query: str, k: int):
     """Get search results with metadata - bypasses bot detection"""
@@ -155,22 +161,22 @@ async def searx_top_links(query: str, k: int):
     async with aiohttp.ClientSession(headers=headers) as s:
         params = {"q": query, "format": "json", "categories": "general"}
         try:
-            print(f"DEBUG: Searching for '{query}'...", flush=True)
+            print(f"DEBUG: Searching for '{query}'...", file=sys.stderr, flush=True)
             async with s.get(SEARX_URL, params=params, timeout=15) as r:
-                print(f"DEBUG: Status {r.status}, Content-Type: {r.headers.get('content-type')}", flush=True)
+                print(f"DEBUG: Status {r.status}, Content-Type: {r.headers.get('content-type')}", file=sys.stderr, flush=True)
                 
                 # Check if we got HTML instead of JSON (bot detection triggered)
                 content_type = r.headers.get('content-type', '')
                 if 'text/html' in content_type:
-                    print(f"DEBUG: SearxNG returned HTML (bot detection) for query '{query}'", flush=True)
+                    print(f"DEBUG: SearxNG returned HTML (bot detection) for query '{query}'", file=sys.stderr, flush=True)
                     html_content = await r.text()
-                    print(f"DEBUG: HTML preview: {html_content[:300]}...", flush=True)
+                    print(f"DEBUG: HTML preview: {html_content[:300]}...", file=sys.stderr, flush=True)
                     return []
                 
                 # Parse JSON response
                 data = await r.json()
                 results_found = len(data.get("results", []))
-                print(f"DEBUG: Found {results_found} results for '{query}'", flush=True)
+                print(f"DEBUG: Found {results_found} results for '{query}'", file=sys.stderr, flush=True)
                 
                 out = []
                 for item in data.get("results", [])[:k]:
@@ -187,13 +193,13 @@ async def searx_top_links(query: str, k: int):
                 return out
                 
         except aiohttp.ClientError as e:
-            print(f"Network error for query '{query}': {e}", flush=True)
+            print(f"Network error for query '{query}': {e}", file=sys.stderr, flush=True)
             return []
         except json.JSONDecodeError as e:
-            print(f"JSON decode error for query '{query}': {e}", flush=True)
+            print(f"JSON decode error for query '{query}': {e}", file=sys.stderr, flush=True)
             return []
         except Exception as e:
-            print(f"Unexpected error for query '{query}': {e}", flush=True)
+            print(f"Unexpected error for query '{query}': {e}", file=sys.stderr, flush=True)
             return []
 
 def extract_page_metadata(html: str, url: str):
@@ -273,13 +279,13 @@ async def fetch_page_with_metadata(url: str, client: httpx.AsyncClient):
             
             return clean_text[:PER_PAGE_CHARS], metadata
     except Exception as e:
-        print(f"Fetch error for {url}: {e}", flush=True)
+        print(f"Fetch error for {url}: {e}", file=sys.stderr, flush=True)
     
     return "", {}
 
 async def bulk_retrieve(prompt: str):
     queries, claim = parse_queries_from_prompt(prompt)
-    print(f"DEBUG: Parsed {len(queries)} queries: {queries}", flush=True)
+    print(f"DEBUG: Parsed {len(queries)} queries: {queries}", file=sys.stderr, flush=True)
     
     # Search all queries in parallel
     search_tasks = [searx_top_links(q, TOP_K) for q in queries]
@@ -288,12 +294,12 @@ async def bulk_retrieve(prompt: str):
     # Flatten results but keep query association
     flat_links = []
     for q, results in zip(queries, search_results):
-        print(f"DEBUG: Query '{q}' returned {len(results)} results", flush=True)
+        print(f"DEBUG: Query '{q}' returned {len(results)} results", file=sys.stderr, flush=True)
         for item in results:
             item["source_query"] = q
             flat_links.append(item)
     
-    print(f"DEBUG: Total {len(flat_links)} links to fetch", flush=True)
+    print(f"DEBUG: Total {len(flat_links)} links to fetch", file=sys.stderr, flush=True)
     
     # Fetch all pages in parallel
     sources = []
@@ -351,7 +357,7 @@ async def bulk_retrieve(prompt: str):
                             if pts:
                                 qc.upsert(WEB_CACHE_COLLECTION, points=pts)
                     except Exception as e:
-                        print(f"Vector cache error for {item['url']}: {e}", flush=True)
+                        print(f"Vector cache error for {item['url']}: {e}", file=sys.stderr, flush=True)
 
                     # Create rich source metadata for citations
                     source = {
@@ -383,7 +389,7 @@ async def bulk_retrieve(prompt: str):
                     if used_chars >= TOTAL_CHARS:
                         break
 
-    print(f"DEBUG: Successfully fetched {len(sources)} sources, {used_chars} chars", flush=True)
+    print(f"DEBUG: Successfully fetched {len(sources)} sources, {used_chars} chars", file=sys.stderr, flush=True)
 
     vec_hits = await vector_search(claim or " ".join(queries), k=TOP_K * 2)
     seen = set(u["url"] for u in sources)
@@ -438,10 +444,16 @@ async def list_tools():
     ]
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream, write_stream, server.create_initialization_options()
-        )
+    async with stdio_transport() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except* (asyncio.CancelledError, BrokenPipeError):
+        pass
+    except* Exception as eg:
+        import traceback
+        print("FATAL ExceptionGroup:", file=sys.stderr, flush=True)
+        traceback.print_exception(eg, file=sys.stderr)
+        sys.exit(1)
