@@ -33,8 +33,8 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
 
 1. **Clone this repository**:
    ```bash
-   git clone https://github.com/yourusername/local-rag-lm-studio.git
-   cd local-rag-lm-studio
+   git clone https://github.com/yourusername/gabesearch-mcp.git
+   cd gabesearch-mcp
    ```
 
 2. **(Optional) Build the Docker image**:

@@ -11,7 +11,11 @@
         "--env","QUERIES=5",
         "--env","PER_PAGE_CHARS=20000",
         "--env","TOTAL_CHARS=100000",
-        "mcp-gabesearch-mcp-gabesearch-mcp:latest"
+        "--env","QDRANT_HOST=host.docker.internal",
+        "--env","QDRANT_PORT=6333",
+        "--env","WEB_CACHE_COLLECTION=web-cache",
+        "--env","WEB_CACHE_TTL_DAYS=10",
+        "gabesearch-mcp:latest"
       ]
     }
   }
