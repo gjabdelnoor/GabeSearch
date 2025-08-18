@@ -6,11 +6,16 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+# Load paging configuration either from a local config module or environment
+try:
+    from config import TOP_K, PER_PAGE_CHARS, TOTAL_CHARS
+except Exception:  # pragma: no cover - fallback for missing config file
+    TOP_K = int(os.getenv("TOP_K", "3"))
+    PER_PAGE_CHARS = int(os.getenv("PER_PAGE_CHARS", "5000"))
+    TOTAL_CHARS = int(os.getenv("TOTAL_CHARS", "25000"))
+
 SEARX_URL = os.getenv("SEARX_URL", "http://localhost:8888/search")
-TOP_K = int(os.getenv("TOP_K", "3"))
 N_QUERIES = int(os.getenv("QUERIES", "5"))
-PER_PAGE_CHARS = int(os.getenv("PER_PAGE_CHARS", "5000"))
-TOTAL_CHARS = int(os.getenv("TOTAL_CHARS", "25000"))
 
 SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
 

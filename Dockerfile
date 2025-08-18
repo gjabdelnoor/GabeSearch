@@ -12,5 +12,6 @@ COPY orchestrator/requirements.txt /app/requirements.txt
 RUN pip install -r requirements.txt
 
 COPY orchestrator/server.py /app/server.py
+COPY orchestrator/config.py /app/config.py
 
 ENTRYPOINT ["python", "/app/server.py"]
