@@ -1,16 +1,23 @@
 {
   "mcpServers": {
-    "GabeSearch-mcp": {
+    "gabesearch-mcp": {
       "command": "docker",
       "args": [
         "run",
         "--rm",
         "-i",
+        "--add-host","host.docker.internal:host-gateway",
         "--env","SEARX_URL=http://host.docker.internal:8888/search",
         "--env","TOP_K=3",
         "--env","QUERIES=5",
-        "--env","PER_PAGE_CHARS=3000",
-        "--env","TOTAL_CHARS=15000",
+        "--env","PER_PAGE_CHARS=20000",
+        "--env","TOTAL_CHARS=100000",
+        "--env","QDRANT_HOST=host.docker.internal",
+        "--env","QDRANT_PORT=6333",
+        "--env","WEB_CACHE_COLLECTION=web-cache",
+        "--env","WEB_CACHE_TTL_DAYS=10",
+        "--env","LOG_LEVEL=INFO",
+        "-v","hf-cache:/root/.cache/huggingface",
         "gabesearch-mcp:latest"
       ]
     }

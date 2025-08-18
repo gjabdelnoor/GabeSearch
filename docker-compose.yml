@@ -1,41 +1,46 @@
 services:
   searxng:
-    image: searxng/searxng:2025.8.12
+    image: searxng/searxng:latest
     restart: unless-stopped
-    environment:
-      SEARXNG_SETTINGS_PATH: /etc/searxng/settings.yml
-      PYTHONWARNINGS: "ignore::DeprecationWarning"
-    volumes:
-      - searxng_etc:/etc/searxng
-      - searxng_data:/var/lib/searxng
-      - ./limiter.toml:/etc/searxng/limiter.toml:ro
-    expose:
-      - "8080"
-
-  nginx:
-    image: nginx:1.27-alpine
-    restart: unless-stopped
-    depends_on:
-      - searxng
     ports:
-      - "127.0.0.1:8888:8888"
+      - "8888:8080"
+    environment:
+      - BASE_URL=http://localhost:8888/
+      - INSTANCE_NAME=LocalSearxNG
     volumes:
-      - ./nginx:/etc/nginx/conf.d:ro
-    command: ["nginx", "-g", "daemon off;"]
+      - ./searxng-config:/etc/searxng:ro
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant-data:/qdrant/storage
 
   gabesearch-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
+    restart: unless-stopped
     stdin_open: true
     tty: true
     environment:
-      - SEARX_URL=http://host.docker.internal:8888/search
+      # Use service DNS names inside the compose network
+      - SEARX_URL=http://searxng:8080/search
       - TOP_K=3
       - QUERIES=5
-      - PER_PAGE_CHARS=3000
-      - TOTAL_CHARS=15000
+      - PER_PAGE_CHARS=20000
+      - TOTAL_CHARS=100000
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - WEB_CACHE_COLLECTION=web-cache
+      - WEB_CACHE_TTL_DAYS=10
+      - LOG_LEVEL=INFO
+    volumes:
+      # Persist HuggingFace model cache
+      - hf-cache:/root/.cache/huggingface
+    depends_on:
+      - searxng
+      - qdrant
 
 volumes:
-  searxng_etc:
-  searxng_data:
+  hf-cache:
