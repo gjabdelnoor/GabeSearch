@@ -1,0 +1,32 @@
+use_default_settings: true
+
+server:
+  secret_key: "MyVerySecretRandomKey123456789abcdef"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+botdetection:
+  ip_limit:
+    filter_link_local: false
+    link_token: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  ban_time_on_fail: 0
+  max_ban_time_on_fail: 0
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    disabled: false
+  - name: bing
+    disabled: false
+    
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 15.0
