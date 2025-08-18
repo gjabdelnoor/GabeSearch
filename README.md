@@ -20,6 +20,7 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
 - ⚡ **Parallel processing** - Fetches multiple sources simultaneously in one tool call minimizing context bloat and prompt processing.
 - 🐳 **One-click setup** - Containerized with Docker for easy deployment
 - 🔧 **Cross-platform** - Works on Windows, Mac, and Linux
+- 🖥️ **GUI prototype** - Electron-based interface to tweak settings and control services
 
 
 ## 🚀 Quick Start
@@ -36,8 +37,13 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
    cd local-rag-lm-studio
    ```
 
-2. **Start the services**:
-   
+2. **(Optional) Build the Docker image**:
+   ```bash
+   docker build . -t gabesearch-mcp:latest
+   ```
+
+3. **Start the services**:
+
    **Windows:**
    ```cmd
    start_servers.bat
@@ -49,13 +55,36 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
    ./start_servers.sh
    ```
 
-3. **Configure LM Studio**:
+4. **Configure LM Studio**:
    - Open LM Studio
    - Go to Settings → Developer → MCP Settings
    - Copy the contents of `lm-studio-config/mcp.json` into your MCP configuration
    - Restart LM Studio
 
-4. **Start searching!** 🎉
+5. **Start searching!** 🎉
+
+### GUI Prototype
+
+An optional Electron-based GUI is available in the `gui` directory for adjusting character limits, query settings, and for starting or stopping the containers. The interface shows run status, reports errors, and disables controls while services are active.
+
+```
+cd gui
+npm install
+npm start
+```
+
+### Enable Hybrid Vector Cache
+
+The default compose stack now includes a [Qdrant](https://qdrant.tech/) vector database to cache fetched pages and enable hybrid retrieval. Configure the cache with the environment variables:
+
+```
+QDRANT_HOST=host.docker.internal
+QDRANT_PORT=6333
+WEB_CACHE_COLLECTION=web-cache
+WEB_CACHE_TTL_DAYS=10
+```
+
+From the GUI you can also index local documents via the **Upload Files** button, which embeds and stores selected files in the same vector cache for small‑scale RAG.
 
 ## 💻 Usage
 

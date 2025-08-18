@@ -2,6 +2,9 @@ import os, re, json, asyncio, aiohttp, httpx
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
+from FlagEmbedding import BGEM3FlagModel
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -11,8 +14,76 @@ TOP_K = int(os.getenv("TOP_K", "3"))
 N_QUERIES = int(os.getenv("QUERIES", "5"))
 PER_PAGE_CHARS = int(os.getenv("PER_PAGE_CHARS", "5000"))
 TOTAL_CHARS = int(os.getenv("TOTAL_CHARS", "25000"))
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+WEB_CACHE_COLLECTION = os.getenv("WEB_CACHE_COLLECTION", "web-cache")
+WEB_CACHE_TTL_DAYS = int(os.getenv("WEB_CACHE_TTL_DAYS", "10"))
 
-server = Server("bulk-rag")
+server = Server("gabesearch-mcp")
+
+_qc = None
+_embed = None
+
+
+def get_qdrant():
+    global _qc
+    if _qc is None:
+        _qc = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        try:
+            _qc.get_collection(WEB_CACHE_COLLECTION)
+        except Exception:
+            _qc.recreate_collection(
+                collection_name=WEB_CACHE_COLLECTION,
+                vectors=qm.VectorParams(size=1024, distance=qm.Distance.COSINE),
+                optimizers_config=qm.OptimizersConfigDiff(indexing_threshold=20000),
+            )
+            _qc.create_payload_index(WEB_CACHE_COLLECTION, field_name="url", field_schema="keyword")
+    return _qc
+
+
+def get_embed():
+    global _embed
+    if _embed is None:
+        _embed = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+    return _embed
+
+
+def chunk_text(txt: str, size=1000, overlap=120):
+    out = []
+    i = 0
+    L = len(txt)
+    while i < L:
+        j = min(L, i + size)
+        seg = txt[i:j].strip()
+        if len(seg) >= 200:
+            out.append((seg, i, j))
+        i += size - overlap
+    return out
+
+
+async def vector_search(q: str, k: int = 12):
+    try:
+        qc = get_qdrant()
+        embed = get_embed()
+        qvec = embed.encode([q], max_length=1024)['dense_vecs'][0]
+        res = qc.search(WEB_CACHE_COLLECTION, query_vector=qvec, limit=k, with_payload=True)
+        hits = []
+        for r in res:
+            p = r.payload
+            hits.append({
+                "id": f"V{len(hits)+1}",
+                "title": p.get("title") or p.get("site"),
+                "url": p.get("url"),
+                "domain": p.get("site"),
+                "snippet": p.get("text", "")[:280],
+                "score": float(r.score),
+                "character_count": len(p.get("text", "")),
+                "status": "from_vector_cache",
+            })
+        return hits
+    except Exception as e:
+        print(f"Vector search error: {e}", flush=True)
+        return []
 
 def parse_queries_from_prompt(prompt: str):
     """Extract queries from JSON or structured text"""
@@ -230,12 +301,58 @@ async def bulk_retrieve(prompt: str):
     used_chars = 0
     
     if flat_links:
-        async with httpx.AsyncClient(headers={"User-Agent": "bulk-rag/0.1"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent": "gabesearch-mcp/0.1"}) as client:
             tasks = [fetch_page_with_metadata(item["url"], client) for item in flat_links]
             pages = await asyncio.gather(*tasks)
             
             for item, (text, fetch_metadata) in zip(flat_links, pages):
                 if text:
+                    try:
+                        qc = get_qdrant()
+                        embed = get_embed()
+                        url_norm = item["url"].split('#')[0].rstrip('/')
+
+                        fresh = False
+                        it = qc.scroll(
+                            WEB_CACHE_COLLECTION,
+                            scroll_filter=qm.Filter(
+                                must=[qm.FieldCondition(key="url", match=qm.MatchValue(value=url_norm))]
+                            ),
+                            limit=1,
+                            with_payload=True,
+                        )
+                        if it and it[0]:
+                            meta0 = it[0][0].payload
+                            ts = meta0.get("fetched_at")
+                            if ts:
+                                if (datetime.now() - datetime.fromisoformat(ts)).days < WEB_CACHE_TTL_DAYS:
+                                    fresh = True
+
+                        if not fresh:
+                            pts = []
+                            for idx, (seg, a, b) in enumerate(chunk_text(text)):
+                                vec = embed.encode([seg], batch_size=1, max_length=2048)['dense_vecs'][0]
+                                pts.append(
+                                    qm.PointStruct(
+                                        id=f"{url_norm}|{idx}|{a}|{b}",
+                                        vector=vec,
+                                        payload={
+                                            "url": url_norm,
+                                            "title": fetch_metadata.get("page_title") or item.get("title"),
+                                            "site": urlparse(item["url"]).netloc,
+                                            "chunk": idx,
+                                            "a": a,
+                                            "b": b,
+                                            "text": seg,
+                                            "fetched_at": fetch_metadata.get("fetch_timestamp"),
+                                        },
+                                    )
+                                )
+                            if pts:
+                                qc.upsert(WEB_CACHE_COLLECTION, points=pts)
+                    except Exception as e:
+                        print(f"Vector cache error for {item['url']}: {e}", flush=True)
+
                     # Create rich source metadata for citations
                     source = {
                         "id": len(sources) + 1,
@@ -253,7 +370,7 @@ async def bulk_retrieve(prompt: str):
                         "status": "successfully_fetched"
                     }
                     sources.append(source)
-                    
+
                     # Add to merged text with source reference
                     chunk = f"[SOURCE {source['id']}] {source['title']}\n{source['url']}\n\n{text}\n\n"
                     
@@ -268,15 +385,27 @@ async def bulk_retrieve(prompt: str):
 
     print(f"DEBUG: Successfully fetched {len(sources)} sources, {used_chars} chars", flush=True)
 
+    vec_hits = await vector_search(claim or " ".join(queries), k=TOP_K * 2)
+    seen = set(u["url"] for u in sources)
+    merged = sources + [h for h in vec_hits if h["url"] not in seen]
+    merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+
     return {
         "queries": queries,
         "claim": claim,
-        "sources": sources,
-        "source_count": len(sources),
+        "sources": merged[:len(sources)],
+        "source_count": len(merged),
         "total_results_found": len(flat_links),
         "merged_text": "".join(merged_text),
         "retrieval_timestamp": datetime.now().isoformat(),
-        "character_count": used_chars
+        "character_count": used_chars,
+        "settings": {
+            "total_chars": TOTAL_CHARS,
+            "per_page_chars": PER_PAGE_CHARS,
+            "top_k": TOP_K,
+            "num_queries": N_QUERIES,
+            "hybrid_vector_cache": True,
+        },
     }
 
 @server.call_tool()

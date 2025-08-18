@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "bulk-rag": {
+    "gabesearch-mcp": {
       "command": "docker",
       "args": [
         "run",
@@ -11,7 +11,7 @@
         "--env","QUERIES=5",
         "--env","PER_PAGE_CHARS=3000",
         "--env","TOTAL_CHARS=15000",
-        "mcp-bulk-rag-bulk-rag:latest"
+        "mcp-gabesearch-mcp-gabesearch-mcp:latest"
       ]
     }
   }

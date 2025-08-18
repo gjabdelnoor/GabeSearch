@@ -1,11 +1,11 @@
 @echo off
 REM Portable Local RAG System Startup Script
-REM This script starts your SearxNG and Bulk RAG Docker services.
+REM This script starts your SearxNG and GabeSearch MCP Docker services.
 
 echo.
 echo =========================================================
 echo   Local RAG System for LM Studio
-echo   Starting SearxNG and Bulk RAG Docker services...
+echo   Starting SearxNG and GabeSearch MCP Docker services...
 echo =========================================================
 echo.
 
@@ -71,11 +71,11 @@ echo =========================================================
 echo.
 echo Your local RAG system is now running:
 echo - SearxNG: http://localhost:8888
-echo - bulk-rag MCP server: Ready for LM Studio
+echo - GabeSearch MCP server: Ready for LM Studio
 echo.
 echo Next steps:
 echo 1. Open LM Studio
-echo 2. Add the bulk-rag MCP server using the config in lm-studio-config/mcp.json
+echo 2. Add the GabeSearch MCP server using the config in lm-studio-config/mcp.json
 echo 3. Start using web search in your conversations!
 echo.
 echo To stop the services later, run: docker compose down

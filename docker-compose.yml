@@ -10,8 +10,8 @@ services:
     volumes:
       - ./searxng-config:/etc/searxng:ro
 
-  bulk-rag:
-    build: ./orchestrator
+  gabesearch-mcp:
+    build: .
     stdin_open: true
     tty: true
     environment:
@@ -20,3 +20,16 @@ services:
       - QUERIES=5
       - PER_PAGE_CHARS=3000
       - TOTAL_CHARS=15000
+      - QDRANT_HOST=host.docker.internal
+      - QDRANT_PORT=6333
+      - WEB_CACHE_COLLECTION=web-cache
+      - WEB_CACHE_TTL_DAYS=10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant-data:/qdrant/storage
+
