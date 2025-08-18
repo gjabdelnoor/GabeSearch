@@ -33,8 +33,8 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
 
 1. **Clone this repository**:
    ```bash
-   git clone https://github.com/yourusername/local-rag-lm-studio.git
-   cd local-rag-lm-studio
+   git clone https://[github.com/yourusername/local-rag-lm-studio.git](https://github.com/gjabdelnoor/GabeSearch.git
+   cd GabeSearch
    ```
 
 2. **Start the services**:
@@ -72,6 +72,7 @@ The tool accepts search queries in JSON format:
   "claim": "Recent advances in AI safety and ethics"
 }
 ```
+
 
 Or use structured text format:
 
