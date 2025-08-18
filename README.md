@@ -20,6 +20,7 @@ A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio]
 - ⚡ **Parallel processing** - Fetches multiple sources simultaneously in one tool call minimizing context bloat and prompt processing.
 - 🐳 **One-click setup** - Containerized with Docker for easy deployment
 - 🔧 **Cross-platform** - Works on Windows, Mac, and Linux
+- 🔄 **Engine rotation** - Rotates queries across multiple engines with randomized browser headers and automatic fallbacks to avoid CAPTCHAs.
 
 
 ## 🚀 Quick Start
@@ -73,3 +74,32 @@ The tool accepts search queries in JSON format:
 ```
 
 Or use structured text format:
+
+```
+QUERIES:
+1. latest developments in AI safety research 2024
+2. OpenAI GPT-4 performance benchmarks
+3. machine learning ethics guidelines
+
+CLAIM:
+Recent advances in AI safety and ethics
+```
+
+### Networking
+
+SearXNG now runs behind a lightweight nginx proxy on port 8888. The proxy injects `X-Forwarded-For` and `X-Real-IP` headers and loads rate-limit rules from `limiter.toml`, helping search engines apply their limits without returning CAPTCHA pages.
+
+### Reliability
+
+Queries randomize typical browser headers and rotate between multiple search engines. If one engine returns no results (for example, due to a CAPTCHA), the tool automatically retries with the next engine.
+
+### Docker build
+
+To create a portable image of the MCP server you can run:
+
+```bash
+docker build . -t gabesearch-mcp:latest
+```
+
+This image contains only the GabeSearch MCP server. Use the provided `docker compose` setup or your own SearXNG instance to handle search requests.
+

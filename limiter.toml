@@ -1,0 +1,10 @@
+[limits.default]
+requests = 30
+seconds  = 60
+
+[limits.paths."/"]
+requests = 20
+seconds  = 60
+
+[punishments.default]
+ban_seconds = 600
