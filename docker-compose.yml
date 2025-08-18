@@ -18,8 +18,8 @@ services:
       - SEARX_URL=http://host.docker.internal:8888/search
       - TOP_K=3
       - QUERIES=5
-      - PER_PAGE_CHARS=3000
-      - TOTAL_CHARS=15000
+      - PER_PAGE_CHARS=20000
+      - TOTAL_CHARS=100000
       - QDRANT_HOST=host.docker.internal
       - QDRANT_PORT=6333
       - WEB_CACHE_COLLECTION=web-cache

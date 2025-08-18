@@ -19,7 +19,7 @@ COPY orchestrator/server.py ./server.py
 ENV SEARX_URL=http://localhost:8888/search \
     TOP_K=3 \
     QUERIES=5 \
-    PER_PAGE_CHARS=3000 \
-    TOTAL_CHARS=15000
+    PER_PAGE_CHARS=20000 \
+    TOTAL_CHARS=100000
 
 ENTRYPOINT ["python", "/app/server.py"]
