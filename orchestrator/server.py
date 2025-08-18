@@ -1,4 +1,4 @@
-import os, re, json, asyncio, aiohttp, httpx
+import os, re, json, random, asyncio, aiohttp, httpx
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse
@@ -11,6 +11,30 @@ TOP_K = int(os.getenv("TOP_K", "3"))
 N_QUERIES = int(os.getenv("QUERIES", "5"))
 PER_PAGE_CHARS = int(os.getenv("PER_PAGE_CHARS", "5000"))
 TOTAL_CHARS = int(os.getenv("TOTAL_CHARS", "25000"))
+
+SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:119.0) Gecko/20100101 Firefox/119.0",
+]
+
+ACCEPT_LANGS = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.8",
+    "en;q=0.7",
+]
+
+def _random_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/html, */*",
+        "Accept-Language": random.choice(ACCEPT_LANGS),
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
 
 server = Server("bulk-rag")
 
@@ -64,66 +88,53 @@ def simple_queries(prompt: str, n: int):
         actual_claim = prompt[:200]
     
     words = [w for w in actual_claim.lower().split() if len(w) > 3][:10]
-    return [" ".join(words)][:n]
+    if not words:
+        return [actual_claim][:n]
+
+    chunk_size = max(1, len(words) // n)
+    queries = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return queries[:n]
 
 async def searx_top_links(query: str, k: int):
-    """Get search results with metadata - bypasses bot detection"""
-    
-    # Headers to bypass SearxNG bot detection
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "X-Forwarded-For": "127.0.0.1",
-        "X-Real-IP": "127.0.0.1",
-        "Accept": "application/json, text/html, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache"
-    }
-    
-    async with aiohttp.ClientSession(headers=headers) as s:
-        params = {"q": query, "format": "json", "categories": "general"}
-        try:
-            print(f"DEBUG: Searching for '{query}'...", flush=True)
-            async with s.get(SEARX_URL, params=params, timeout=15) as r:
-                print(f"DEBUG: Status {r.status}, Content-Type: {r.headers.get('content-type')}", flush=True)
-                
-                # Check if we got HTML instead of JSON (bot detection triggered)
-                content_type = r.headers.get('content-type', '')
-                if 'text/html' in content_type:
-                    print(f"DEBUG: SearxNG returned HTML (bot detection) for query '{query}'", flush=True)
-                    html_content = await r.text()
-                    print(f"DEBUG: HTML preview: {html_content[:300]}...", flush=True)
-                    return []
-                
-                # Parse JSON response
-                data = await r.json()
-                results_found = len(data.get("results", []))
-                print(f"DEBUG: Found {results_found} results for '{query}'", flush=True)
-                
-                out = []
-                for item in data.get("results", [])[:k]:
-                    result = {
-                        "title": item.get("title", "").strip(),
-                        "url": item.get("url", "").strip(),
-                        "snippet": item.get("content", "").strip(),
-                        "engine": item.get("engine", "unknown"),
-                        "publishedDate": item.get("publishedDate", ""),
-                        "domain": urlparse(item.get("url", "")).netloc,
-                        "query": query,
-                    }
-                    out.append(result)
-                return out
-                
-        except aiohttp.ClientError as e:
-            print(f"Network error for query '{query}': {e}", flush=True)
-            return []
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error for query '{query}': {e}", flush=True)
-            return []
-        except Exception as e:
-            print(f"Unexpected error for query '{query}': {e}", flush=True)
-            return []
+    """Get search results with randomized headers and engine rotation."""
+
+    engines = SEARCH_ENGINES.copy()
+    random.shuffle(engines)
+
+    async with aiohttp.ClientSession() as s:
+        for engine in engines:
+            params = {"q": query, "format": "json", "engines": engine}
+            headers = _random_headers()
+            try:
+                print(f"DEBUG: Searching '{query}' via {engine}", flush=True)
+                async with s.get(SEARX_URL, params=params, headers=headers, timeout=15) as r:
+                    content_type = r.headers.get("content-type", "")
+                    if "application/json" not in content_type:
+                        print(f"DEBUG: {engine} returned non-JSON for '{query}' (type={content_type})", flush=True)
+                        continue
+
+                    data = await r.json()
+                    if not data.get("results"):
+                        print(f"DEBUG: {engine} yielded no results for '{query}'", flush=True)
+                        continue
+
+                    out = []
+                    for item in data.get("results", [])[:k]:
+                        out.append({
+                            "title": item.get("title", "").strip(),
+                            "url": item.get("url", "").strip(),
+                            "snippet": item.get("content", "").strip(),
+                            "engine": item.get("engine", engine),
+                            "publishedDate": item.get("publishedDate", ""),
+                            "domain": urlparse(item.get("url", "")).netloc,
+                            "query": query,
+                            "source_query": query,
+                        })
+                    return out
+            except Exception as e:
+                print(f"DEBUG: error with engine {engine} for '{query}': {e}", flush=True)
+                continue
+    return []
 
 def extract_page_metadata(html: str, url: str):
     """Extract metadata from HTML"""
@@ -243,7 +254,7 @@ async def bulk_retrieve(prompt: str):
                         "url": item["url"],
                         "domain": item["domain"],
                         "snippet": item["snippet"],
-                        "source_query": item["source_query"],
+                        "source_query": item.get("source_query", ""),
                         "search_engine": item["engine"],
                         "author": fetch_metadata.get("meta_author", ""),
                         "publish_date": fetch_metadata.get("meta_date", ""),
