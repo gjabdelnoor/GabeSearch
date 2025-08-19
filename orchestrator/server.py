@@ -6,6 +6,8 @@ from urllib.parse import urlparse
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from qdrant_client import QdrantClient
+from FlagEmbedding import FlagModel
 
 # Load paging configuration either from a local config module or environment
 try:
@@ -21,6 +23,14 @@ N_QUERIES = int(os.getenv("QUERIES", "5"))
 STRICT_ARGS = os.getenv("STRICT_ARGS", "false").lower() == "true"
 MAX_QUERIES = int(os.getenv("MAX_QUERIES", "12"))
 LOG_ARG_WARNINGS = os.getenv("LOG_ARG_WARNINGS", "true").lower() == "true"
+
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_COLLECTION = os.getenv("WEB_CACHE_COLLECTION", "web-cache")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+
+_qdrant_client: Optional[QdrantClient] = None
+_embed_model: Optional[FlagModel] = None
 
 SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
 
@@ -371,6 +381,47 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
         "character_count": used_chars
     }
 
+
+@server.call_tool()
+async def rag_query(name: str, arguments: dict):
+    if name != "rag_query":
+        raise ValueError(f"Unknown tool: {name}")
+
+    query = str(arguments.get("query", "")).strip()
+    k = int(arguments.get("k", 5))
+    if not query:
+        err = {"error": "query is required"}
+        return [TextContent(type="text", text=json.dumps(err))]
+
+    global _qdrant_client, _embed_model
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    if _embed_model is None:
+        _embed_model = FlagModel(EMBED_MODEL_NAME, use_fp16=False)
+
+    loop = asyncio.get_running_loop()
+    vector = await loop.run_in_executor(None, lambda: _embed_model.encode([query])[0])
+
+    def _search():
+        return _qdrant_client.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=vector.tolist(),
+            limit=k,
+            with_payload=True,
+        )
+
+    results = await loop.run_in_executor(None, _search)
+    matches = []
+    for r in results:
+        payload = r.payload or {}
+        matches.append({
+            "text": payload.get("text") or payload.get("content") or "",
+            "metadata": payload,
+            "score": r.score,
+        })
+
+    return [TextContent(type="text", text=json.dumps({"matches": matches}, ensure_ascii=False))]
+
 @server.call_tool()
 async def search_and_retrieve(name: str, arguments: dict):
     if name != "search_and_retrieve":
@@ -405,7 +456,20 @@ async def list_tools():
                 "type": "object",
                 "additionalProperties": True,
             },
-        )
+        ),
+        Tool(
+            name="rag_query",
+            description="Similarity search over the Qdrant cache. Args: query (str), k (int, optional).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "k": {"type": "integer"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
     ]
 
 async def main():
