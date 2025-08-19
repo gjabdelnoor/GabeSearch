@@ -1,106 +1,60 @@
-# 🔍 GabeSearch MCP - multiple searches in one tool call!
+# GabeSearch MCP
 
-NOTE: I made this with the help of Sonnet 4, moderate your expectations accordingly.
+GabeSearch is a local MCP server that gives [LM Studio](https://lmstudio.ai) access to real-time web search and retrieval.  Search results are fetched through a local [SearXNG](https://docs.searxng.org/) instance, embedded with [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) and stored in [Qdrant](https://qdrant.tech/) for fast RAG queries.  Everything runs locally with no API keys or external services.
 
-The reason I made this as such a botch job was I noticed that the Fetch and Playwright tools would only pull one website or perform one action per tool call. If you are using local inference with limited context windows and dodgy tool use, this can quickly become unusable for QA applications. The solution was to have multiple searxng queries running in parallel, to have one big tool call instead of multiple small tool calls that rot the context window.
+## Features
+- **Real-time web search** through SearXNG
+- **Vector cache** in Qdrant using BAAI/bge-small-en-v1.5 embeddings
+- **Configurable chunking and deduplication** to reduce prompt bloat
+- **Fully local**: runs with Docker on Windows, macOS and Linux
 
-That being said, I come from a non-technical background, and at the risk of overstating issues with this extension, when I made it Sonnet 4 and God knew how it works. So When you try to use this I recommend querying both to see where that gets you.
-
-[![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)](https://docker.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![LM Studio](https://img.shields.io/badge/LM%20Studio-MCP%20Extension-green)](https://lmstudio.ai)
-
-A fully local Retrieval Augmented Generation (RAG) system that gives [LM Studio](https://lmstudio.ai) access to real-time web search without any API keys or paid services.
-
-
-## ✨ Features
-
-- 🌐 **Real-time web search** - Access current information from search engines, improve QA performance.
-- 🏠 **100% local** - No API keys, no external services, 100% free
-- ⚡ **Parallel processing** - Fetches multiple sources simultaneously in one tool call minimizing context bloat and prompt processing.
-- 🐳 **One-click setup** - Containerized with Docker for easy deployment
-- 🔧 **Cross-platform** - Works on Windows, Mac, and Linux
-- 🔄 **Engine rotation** - Rotates queries across multiple engines with randomized browser headers and automatic fallbacks to avoid CAPTCHAs.
-
-
-## 🚀 Quick Start
-
-### Prerequisites
+## Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
 - [LM Studio](https://lmstudio.ai) installed
 
-### Installation
-
-1. **Clone this repository**:
+## Quick Start
+1. Clone and start the services:
    ```bash
-   git clone https://[github.com/yourusername/local-rag-lm-studio.git](https://github.com/gjabdelnoor/GabeSearch.git
+   git clone https://github.com/gjabdelnoor/GabeSearch.git
    cd GabeSearch
+   ./start_servers.sh        # or start_servers.bat on Windows
    ```
-
-2. **Start the services**:
-   
-   **Windows:**
-   ```cmd
-   start_servers.bat
-   ```
-   
-   **Mac/Linux:**
-   ```bash
-   chmod +x start_servers.sh
-   ./start_servers.sh
-   ```
-
-3. **Configure LM Studio**:
-   - Open LM Studio
-   - Go to Settings → Developer → MCP Settings
+2. Configure LM Studio:
+   - Open LM Studio → **Settings** → **Developer** → **MCP Settings**
    - Copy the contents of `lm-studio-config/mcp.json` into your MCP configuration
    - Restart LM Studio
 
-4. **Start searching!** 🎉
+## Usage
+The server exposes two tools:
 
-## 💻 Usage
+- `search_and_retrieve` – generate multiple search queries for a prompt, scrape pages and return deduplicated RAG chunks.
+  ```json
+  {"prompt": "LLM reasoning capabilities 2024"}
+  ```
+- `rag_query` – query the existing vector cache directly.
+  ```json
+  {"query": "vector databases", "k": 10}
+  ```
 
-The tool accepts search queries in JSON format:
+Results include the text snippet, page title, source URL and a confidence score.
 
-```json
-{
-  "queries": [
-    "latest developments in AI safety research 2024",
-    "OpenAI GPT-4 performance benchmarks",
-    "machine learning ethics guidelines"
-  ],
-  "claim": "Recent advances in AI safety and ethics"
-}
-```
+## Configuration
+Environment variables in `lm-studio-config/mcp.json` allow tuning:
 
+- `SEARX_URL` – SearXNG search endpoint
+- `TOP_K` – results fetched per query
+- `QUERIES` – number of search queries to generate
+- `PER_PAGE_CHARS` / `TOTAL_CHARS` – page and total character limits
+- `QDRANT_HOST` / `QDRANT_PORT` – location of the Qdrant service
+- `WEB_CACHE_COLLECTION` – Qdrant collection name
+- `EMBED_MODEL` – embedding model used for RAG
+- `CHUNKS_PER_QUERY` / `CHUNK_CHARS` – size and count of text chunks
+- `DEDUP_THRESHOLD` – similarity threshold for deduplication
 
-Or use structured text format:
+Adjust these as needed before running the container.
 
-```
-QUERIES:
-1. latest developments in AI safety research 2024
-2. OpenAI GPT-4 performance benchmarks
-3. machine learning ethics guidelines
-
-CLAIM:
-Recent advances in AI safety and ethics
-```
-
-### Networking
-
-SearXNG now runs behind a lightweight nginx proxy on port 8888. The proxy injects `X-Forwarded-For` and `X-Real-IP` headers and loads rate-limit rules from `limiter.toml`, helping search engines apply their limits without returning CAPTCHA pages.
-
-### Reliability
-
-Queries randomize typical browser headers and rotate between multiple search engines. If one engine returns no results (for example, due to a CAPTCHA), the tool automatically retries with the next engine.
-
-### Docker build
-
-To create a portable image of the MCP server you can run:
-
+## Docker build
+To build the MCP server image separately:
 ```bash
 docker build . -t gabesearch-mcp:latest
 ```
-
-This image contains only the GabeSearch MCP server. Use the provided `docker compose` setup or your own SearXNG instance to handle search requests.
-
