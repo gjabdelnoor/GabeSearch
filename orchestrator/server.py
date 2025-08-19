@@ -1,11 +1,15 @@
-import os, re, json, random, asyncio, aiohttp, httpx, ast
-from typing import Any, Dict, List, Optional
+import os, re, json, random, asyncio, aiohttp, httpx, ast, uuid, time, hashlib, logging
+from typing import Any, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+from FlagEmbedding import FlagModel
+import numpy as np
 
 # Load paging configuration either from a local config module or environment
 try:
@@ -18,9 +22,195 @@ except Exception:  # pragma: no cover - fallback for missing config file
 SEARX_URL = os.getenv("SEARX_URL", "http://localhost:8888/search")
 N_QUERIES = int(os.getenv("QUERIES", "5"))
 
+# Configurable tuning knobs
+DEDUP_THRESHOLD = float(os.getenv("DEDUP_THRESHOLD", "0.8"))
+NUM_QUERIES = int(os.getenv("NUM_QUERIES", str(N_QUERIES)))
+CHUNKS_PER_QUERY = int(os.getenv("CHUNKS_PER_QUERY", "15"))
+CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "350"))
+CACHE_TTL = int(os.getenv("RAG_CACHE_TTL", "3600"))
+
 STRICT_ARGS = os.getenv("STRICT_ARGS", "false").lower() == "true"
 MAX_QUERIES = int(os.getenv("MAX_QUERIES", "12"))
 LOG_ARG_WARNINGS = os.getenv("LOG_ARG_WARNINGS", "true").lower() == "true"
+
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_COLLECTION = os.getenv("WEB_CACHE_COLLECTION", "web-cache")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+
+_qdrant_client: Optional[QdrantClient] = None
+_embed_model: Optional[FlagModel] = None
+RAG_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+logging.basicConfig(level=logging.INFO)
+
+
+def _ensure_clients():
+    global _qdrant_client, _embed_model
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    if _embed_model is None:
+        _embed_model = FlagModel(EMBED_MODEL_NAME, use_fp16=False)
+
+
+async def _upsert_text(text: str, metadata: Dict[str, Any]):
+    _ensure_clients()
+    loop = asyncio.get_running_loop()
+    vector = await loop.run_in_executor(None, lambda: _embed_model.encode([text])[0])
+    point = PointStruct(
+        id=metadata.get("url") or metadata.get("id") or str(uuid.uuid4()),
+        vector=vector.tolist(),
+        payload={"text": text, **metadata},
+    )
+    await loop.run_in_executor(
+        None,
+        lambda: _qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=[point]),
+    )
+
+
+async def _upsert_texts(docs: List[Dict[str, Any]]):
+    """Batch upsert texts with metadata"""
+    if not docs:
+        return
+    _ensure_clients()
+    loop = asyncio.get_running_loop()
+
+    texts = [d["text"] for d in docs]
+    vectors = await loop.run_in_executor(None, lambda: _embed_model.encode(texts))
+    points = []
+    for vec, doc in zip(vectors, docs):
+        meta = doc["metadata"]
+        points.append(
+            PointStruct(
+                id=meta.get("url") or meta.get("id") or str(uuid.uuid4()),
+                vector=vec.tolist(),
+                payload={"text": doc["text"], **meta},
+            )
+        )
+
+    await loop.run_in_executor(
+        None,
+        lambda: _qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=points),
+    )
+
+
+async def _rag_search(query: str, k: int):
+    _ensure_clients()
+    loop = asyncio.get_running_loop()
+    vector = await loop.run_in_executor(None, lambda: _embed_model.encode([query])[0])
+
+    def _search():
+        return _qdrant_client.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=vector.tolist(),
+            limit=k,
+            with_payload=True,
+            with_vectors=True,
+        )
+
+    results = await loop.run_in_executor(None, _search)
+    matches = []
+    keywords = [kw.lower() for kw in query.split()]
+    for r in results:
+        payload = r.payload or {}
+        text = payload.get("text") or payload.get("content") or ""
+        kw_hits = sum(1 for kw in keywords if kw in text.lower())
+        matches.append(
+            {
+                "text": text,
+                "metadata": payload,
+                "score": r.score + kw_hits * 0.05,
+                "vector": r.vector,
+            }
+        )
+    return matches
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    a_vec, b_vec = np.array(a), np.array(b)
+    return float(np.dot(a_vec, b_vec) / ((np.linalg.norm(a_vec) * np.linalg.norm(b_vec)) + 1e-10))
+
+
+def _source_type(domain: str) -> str:
+    domain = domain.lower()
+    if "arxiv" in domain:
+        return "academic"
+    if "medium" in domain or "blog" in domain:
+        return "blog"
+    if "wikipedia" in domain:
+        return "reference"
+    return "other"
+
+
+def _parse_date(d: str) -> datetime:
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(d[:19], fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(d)
+    except Exception:
+        return datetime(1970, 1, 1)
+
+
+def _deduplicate_chunks(matches: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    unique_matches: List[Dict[str, Any]] = []
+    diversity: Dict[str, int] = {}
+    for match in matches:
+        vec = match.get("vector")
+        meta = match.get("metadata", {})
+        dom = meta.get("domain", "")
+        pub_date = _parse_date(meta.get("publish_date", meta.get("meta_date", "")))
+        s_type = _source_type(dom)
+        is_duplicate = False
+        for existing in unique_matches:
+            if vec is not None and existing.get("vector") is not None:
+                if _cosine_similarity(vec, existing["vector"]) > DEDUP_THRESHOLD:
+                    is_duplicate = True
+                    break
+            if dom and dom == existing.get("metadata", {}).get("domain"):
+                is_duplicate = True
+                break
+        if is_duplicate:
+            continue
+        if len(unique_matches) > 5 and pub_date < datetime.now() - timedelta(days=365):
+            continue
+        if diversity.get(s_type, 0) >= 3:
+            continue
+        diversity[s_type] = diversity.get(s_type, 0) + 1
+        match["metadata"]["source_type"] = s_type
+        unique_matches.append(match)
+
+    now = datetime.now()
+    for m in unique_matches:
+        meta = m.get("metadata", {})
+        pub_date = _parse_date(meta.get("publish_date", meta.get("meta_date", "")))
+        recency = max(0.0, 1 - (now - pub_date).days / 365)
+        m["confidence"] = m.get("score", 0) * 0.7 + recency * 0.3
+
+    unique_matches.sort(key=lambda m: m.get("confidence", m.get("score", 0)), reverse=True)
+    return unique_matches[:k]
+
+
+async def _smart_rag_search(query: str, k: int = CHUNKS_PER_QUERY) -> List[Dict[str, Any]]:
+    key = hashlib.sha256(query.encode()).hexdigest()
+    now = time.time()
+    cached = RAG_CACHE.get(key)
+    if cached and now - cached[0] < CACHE_TTL:
+        logging.info(f"Cache hit for query '{query}'")
+        return cached[1][:k]
+
+    raw_matches = await _rag_search(query, k * 2)
+    unique_matches = _deduplicate_chunks(raw_matches, k)
+    for match in unique_matches:
+        match["text"] = match["text"][:CHUNK_CHARS]
+
+    logging.info(
+        f"Raw matches: {len(raw_matches)}, Unique after dedup: {len(unique_matches)}"
+    )
+    RAG_CACHE[key] = (now, unique_matches)
+    return unique_matches
 
 SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
 
@@ -113,6 +303,21 @@ def _extract_queries_from_text(text: str) -> List[str]:
             if 1 <= len(lines) <= 20:
                 qs.extend(lines)
     return qs
+
+
+def generate_search_queries(prompt: str) -> List[str]:
+    prompt = prompt.strip()[:200]
+    if not prompt:
+        return []
+    base = prompt
+    variations = [
+        base,
+        f"latest {base}",
+        f"{base} research",
+        f"news on {base}",
+        f"background of {base}",
+    ]
+    return variations[:NUM_QUERIES]
 
 def normalize_args(args: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(args.get("queries"), list) and all(isinstance(x, str) for x in args["queries"]):
@@ -318,8 +523,7 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
     
     # Fetch all pages in parallel
     sources = []
-    merged_text = []
-    used_chars = 0
+    to_upsert: List[Dict[str, Any]] = []
     
     if flat_links:
         async with httpx.AsyncClient(headers={"User-Agent": "GabeSearch-mcp/0.1"}) as client:
@@ -345,20 +549,15 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
                         "status": "successfully_fetched"
                     }
                     sources.append(source)
-                    
-                    # Add to merged text with source reference
-                    chunk = f"[SOURCE {source['id']}] {source['title']}\n{source['url']}\n\n{text}\n\n"
-                    
-                    if used_chars + len(chunk) > TOTAL_CHARS:
-                        chunk = chunk[:max(0, TOTAL_CHARS - used_chars)]
-                    
-                    merged_text.append(chunk)
-                    used_chars += len(chunk)
-                    
-                    if used_chars >= TOTAL_CHARS:
-                        break
+                    to_upsert.append({"text": text, "metadata": source})
 
-    print(f"DEBUG: Successfully fetched {len(sources)} sources, {used_chars} chars", flush=True)
+    if to_upsert:
+        try:
+            await _upsert_texts(to_upsert)
+        except Exception as e:
+            print(f"Batch upsert failed: {e}", flush=True)
+
+    print(f"DEBUG: Successfully fetched {len(sources)} sources", flush=True)
 
     return {
         "queries": queries,
@@ -366,33 +565,96 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
         "sources": sources,
         "source_count": len(sources),
         "total_results_found": len(flat_links),
-        "merged_text": "".join(merged_text),
         "retrieval_timestamp": datetime.now().isoformat(),
-        "character_count": used_chars
     }
+
 
 @server.call_tool()
 async def search_and_retrieve(name: str, arguments: dict):
     if name != "search_and_retrieve":
         raise ValueError(f"Unknown tool: {name}")
 
-    try:
-        args = normalize_args(arguments if isinstance(arguments, dict) else {"prompt": str(arguments)})
-    except Exception as e:
+    if not isinstance(arguments, dict) or not isinstance(arguments.get("prompt"), str):
         err = {
-            "error": f"Argument parsing failed: {e}",
-            "hint": {
-                "expected": {"queries": ["..."], "claim": "optional"},
-                "examples": [
-                    {"queries": ["ant pheromones 2024", "mosquito saliva proteome 2025"]},
-                    {"prompt": "QUERIES:\n- ant pheromones 2024\n- mosquito saliva proteome 2025\nCLAIM: find OA reviews"},
-                ],
-            },
+            "error": "Expected object with 'prompt' string",
+            "example": {"prompt": "LLM reasoning capabilities 2024"},
         }
         return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
-    result = await bulk_retrieve(args["queries"], args.get("claim"))
+    prompt = arguments["prompt"][:200]
+    queries = generate_search_queries(prompt)
 
+    start = time.time()
+
+    try:
+        await bulk_retrieve(queries)
+    except Exception as e:
+        print(f"bulk_retrieve failed: {e}", flush=True)
+
+    all_matches: List[Dict[str, Any]] = []
+    for q in queries:
+        try:
+            all_matches.extend(await _smart_rag_search(q, CHUNKS_PER_QUERY))
+        except Exception as e:
+            print(f"RAG search failed for {q}: {e}", flush=True)
+
+    final_matches = _deduplicate_chunks(all_matches, CHUNKS_PER_QUERY * 2)
+
+    chunks = [
+        {
+            "text": m["text"],
+            "title": m.get("metadata", {}).get("title", ""),
+            "url": m.get("metadata", {}).get("url", ""),
+            "domain": m.get("metadata", {}).get("domain", ""),
+            "score": m.get("score", 0),
+            "confidence": m.get("confidence", m.get("score", 0)),
+        }
+        for m in final_matches
+    ]
+
+    result = {
+        "query": prompt,
+        "chunks": chunks,
+        "total_chunks": len(chunks),
+        "processing_time_ms": int((time.time() - start) * 1000),
+    }
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+@server.call_tool()
+async def rag_query(name: str, arguments: dict):
+    if name != "rag_query":
+        raise ValueError(f"Unknown tool: {name}")
+
+    if not isinstance(arguments, dict) or not isinstance(arguments.get("query"), str):
+        err = {
+            "error": "Expected object with 'query' string",
+            "example": {"query": "vector databases"},
+        }
+        return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+    query = arguments["query"]
+    k = int(arguments.get("k", CHUNKS_PER_QUERY))
+
+    matches = await _smart_rag_search(query, k)
+    chunks = [
+        {
+            "text": m["text"],
+            "title": m.get("metadata", {}).get("title", ""),
+            "url": m.get("metadata", {}).get("url", ""),
+            "domain": m.get("metadata", {}).get("domain", ""),
+            "score": m.get("score", 0),
+            "confidence": m.get("confidence", m.get("score", 0)),
+        }
+        for m in matches
+    ]
+
+    result = {
+        "query": query,
+        "chunks": chunks,
+        "total_chunks": len(chunks),
+    }
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 @server.list_tools()
@@ -400,12 +662,27 @@ async def list_tools():
     return [
         Tool(
             name="search_and_retrieve",
-            description="Bulk search and retrieve content with citation metadata. Accepts flexible query input formats.",
+            description="Search, scrape, vectorize into Qdrant, and return deduplicated RAG chunks for a prompt.",
             inputSchema={
                 "type": "object",
-                "additionalProperties": True,
+                "properties": {"prompt": {"type": "string"}},
+                "required": ["prompt"],
+                "additionalProperties": False,
             },
-        )
+        ),
+        Tool(
+            name="rag_query",
+            description="Run RAG similarity search over existing vectors.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "k": {"type": "integer", "minimum": 1},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
     ]
 
 async def main():
