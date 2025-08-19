@@ -1,4 +1,4 @@
-import os, re, json, random, asyncio, aiohttp, httpx, ast, uuid
+import os, re, json, random, asyncio, aiohttp, httpx, ast, uuid, time
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -9,6 +9,7 @@ from mcp.types import Tool, TextContent
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from FlagEmbedding import FlagModel
+import numpy as np
 
 # Load paging configuration either from a local config module or environment
 try:
@@ -68,6 +69,7 @@ async def _rag_search(query: str, k: int):
             query_vector=vector.tolist(),
             limit=k,
             with_payload=True,
+            with_vectors=True,
         )
 
     results = await loop.run_in_executor(None, _search)
@@ -79,9 +81,42 @@ async def _rag_search(query: str, k: int):
                 "text": payload.get("text") or payload.get("content") or "",
                 "metadata": payload,
                 "score": r.score,
+                "vector": r.vector,
             }
         )
     return matches
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    a_vec, b_vec = np.array(a), np.array(b)
+    return float(np.dot(a_vec, b_vec) / ((np.linalg.norm(a_vec) * np.linalg.norm(b_vec)) + 1e-10))
+
+
+def _deduplicate_chunks(matches: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    unique_matches: List[Dict[str, Any]] = []
+    for match in matches:
+        vec = match.get("vector")
+        dom = match.get("metadata", {}).get("domain")
+        is_duplicate = False
+        for existing in unique_matches:
+            if vec is not None and existing.get("vector") is not None:
+                if _cosine_similarity(vec, existing["vector"]) > 0.8:
+                    is_duplicate = True
+                    break
+            if dom and dom == existing.get("metadata", {}).get("domain"):
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            unique_matches.append(match)
+    return unique_matches[:k]
+
+
+async def _smart_rag_search(query: str, k: int = 15) -> List[Dict[str, Any]]:
+    raw_matches = await _rag_search(query, k * 2)
+    unique_matches = _deduplicate_chunks(raw_matches, k)
+    for match in unique_matches:
+        match["text"] = match["text"][:350]
+    return unique_matches
 
 SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
 
@@ -174,6 +209,21 @@ def _extract_queries_from_text(text: str) -> List[str]:
             if 1 <= len(lines) <= 20:
                 qs.extend(lines)
     return qs
+
+
+def generate_search_queries(prompt: str) -> List[str]:
+    prompt = prompt.strip()[:200]
+    if not prompt:
+        return []
+    base = prompt
+    variations = [
+        base,
+        f"latest {base}",
+        f"{base} research",
+        f"news on {base}",
+        f"background of {base}",
+    ]
+    return variations[:5]
 
 def normalize_args(args: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(args.get("queries"), list) and all(isinstance(x, str) for x in args["queries"]):
@@ -379,8 +429,6 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
     
     # Fetch all pages in parallel
     sources = []
-    merged_text = []
-    used_chars = 0
     
     if flat_links:
         async with httpx.AsyncClient(headers={"User-Agent": "GabeSearch-mcp/0.1"}) as client:
@@ -413,19 +461,7 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
                     except Exception as e:
                         print(f"Upsert failed for {item['url']}: {e}", flush=True)
 
-                    # Add to merged text with source reference
-                    chunk = f"[SOURCE {source['id']}] {source['title']}\n{source['url']}\n\n{text}\n\n"
-                    
-                    if used_chars + len(chunk) > TOTAL_CHARS:
-                        chunk = chunk[:max(0, TOTAL_CHARS - used_chars)]
-                    
-                    merged_text.append(chunk)
-                    used_chars += len(chunk)
-                    
-                    if used_chars >= TOTAL_CHARS:
-                        break
-
-    print(f"DEBUG: Successfully fetched {len(sources)} sources, {used_chars} chars", flush=True)
+    print(f"DEBUG: Successfully fetched {len(sources)} sources", flush=True)
 
     return {
         "queries": queries,
@@ -433,9 +469,7 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
         "sources": sources,
         "source_count": len(sources),
         "total_results_found": len(flat_links),
-        "merged_text": "".join(merged_text),
         "retrieval_timestamp": datetime.now().isoformat(),
-        "character_count": used_chars
     }
 
 
@@ -444,33 +478,49 @@ async def search_and_retrieve(name: str, arguments: dict):
     if name != "search_and_retrieve":
         raise ValueError(f"Unknown tool: {name}")
 
-    try:
-        args = normalize_args(arguments if isinstance(arguments, dict) else {"prompt": str(arguments)})
-    except Exception as e:
+    if not isinstance(arguments, dict) or not isinstance(arguments.get("prompt"), str):
         err = {
-            "error": f"Argument parsing failed: {e}",
-            "hint": {
-                "expected": {"queries": ["..."], "claim": "optional"},
-                "examples": [
-                    {"queries": ["ant pheromones 2024", "mosquito saliva proteome 2025"]},
-                    {"prompt": "QUERIES:\n- ant pheromones 2024\n- mosquito saliva proteome 2025\nCLAIM: find OA reviews"},
-                ],
-            },
+            "error": "Expected object with 'prompt' string",
+            "example": {"prompt": "LLM reasoning capabilities 2024"},
         }
         return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
-    k = int(arguments.get("k", 5)) if isinstance(arguments, dict) else 5
+    prompt = arguments["prompt"][:200]
+    queries = generate_search_queries(prompt)
 
-    result = await bulk_retrieve(args["queries"], args.get("claim"))
+    start = time.time()
 
-    rag_results = {}
-    for q in args["queries"]:
+    try:
+        await bulk_retrieve(queries)
+    except Exception as e:
+        print(f"bulk_retrieve failed: {e}", flush=True)
+
+    all_matches: List[Dict[str, Any]] = []
+    for q in queries:
         try:
-            rag_results[q] = await _rag_search(q, k)
+            all_matches.extend(await _smart_rag_search(q, 15))
         except Exception as e:
-            rag_results[q] = {"error": str(e)}
+            print(f"RAG search failed for {q}: {e}", flush=True)
 
-    result["rag_matches"] = rag_results
+    final_matches = _deduplicate_chunks(all_matches, 30)
+
+    chunks = [
+        {
+            "text": m["text"],
+            "title": m.get("metadata", {}).get("title", ""),
+            "url": m.get("metadata", {}).get("url", ""),
+            "domain": m.get("metadata", {}).get("domain", ""),
+            "score": m.get("score", 0),
+        }
+        for m in final_matches
+    ]
+
+    result = {
+        "query": prompt,
+        "chunks": chunks,
+        "total_chunks": len(chunks),
+        "processing_time_ms": int((time.time() - start) * 1000),
+    }
 
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -479,13 +529,12 @@ async def list_tools():
     return [
         Tool(
             name="search_and_retrieve",
-            description="Search, scrape, vectorize into Qdrant, and run similarity search (RAG). Accepts flexible query formats and optional k for top matches.",
+            description="Search, scrape, vectorize into Qdrant, and return deduplicated RAG chunks for a prompt.",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "k": {"type": "integer"},
-                },
-                "additionalProperties": True,
+                "properties": {"prompt": {"type": "string"}},
+                "required": ["prompt"],
+                "additionalProperties": False,
             },
         ),
     ]
