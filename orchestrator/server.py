@@ -7,6 +7,34 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+ENABLE_VECTOR_CACHE = os.getenv("ENABLE_VECTOR_CACHE", "false").lower() == "true"
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "search_cache")
+if ENABLE_VECTOR_CACHE:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http.models import Distance, VectorParams, PointStruct
+    from FlagEmbedding import FlagModel
+
+    _qdrant = QdrantClient(url=QDRANT_URL)
+    _embed_model = FlagModel(os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5"))
+
+    def embed_text(text: str) -> List[float]:
+        return _embed_model.encode([text])[0].tolist()
+
+    _dim = len(embed_text("dimension probe"))
+    try:
+        _qdrant.get_collection(QDRANT_COLLECTION)
+    except Exception:
+        _qdrant.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=_dim, distance=Distance.COSINE),
+        )
+else:
+    _qdrant = None
+
+    def embed_text(text: str) -> List[float]:
+        return []
+
 # Load paging configuration either from a local config module or environment
 try:
     from config import TOP_K, PER_PAGE_CHARS, TOTAL_CHARS
@@ -345,7 +373,20 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
                         "status": "successfully_fetched"
                     }
                     sources.append(source)
-                    
+
+                    if ENABLE_VECTOR_CACHE:
+                        vec = embed_text(text)
+                        _qdrant.upsert(
+                            collection_name=QDRANT_COLLECTION,
+                            points=[
+                                PointStruct(
+                                    id=source["url"],
+                                    vector=vec,
+                                    payload={"text": text, "metadata": source},
+                                )
+                            ],
+                        )
+
                     # Add to merged text with source reference
                     chunk = f"[SOURCE {source['id']}] {source['title']}\n{source['url']}\n\n{text}\n\n"
                     
