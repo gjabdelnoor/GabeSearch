@@ -1,4 +1,4 @@
-import os, re, json, random, asyncio, aiohttp, httpx, ast
+import os, re, json, random, asyncio, aiohttp, httpx, ast, uuid
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -7,6 +7,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
 from FlagEmbedding import FlagModel
 
 # Load paging configuration either from a local config module or environment
@@ -31,6 +32,56 @@ EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 _qdrant_client: Optional[QdrantClient] = None
 _embed_model: Optional[FlagModel] = None
+
+
+def _ensure_clients():
+    global _qdrant_client, _embed_model
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    if _embed_model is None:
+        _embed_model = FlagModel(EMBED_MODEL_NAME, use_fp16=False)
+
+
+async def _upsert_text(text: str, metadata: Dict[str, Any]):
+    _ensure_clients()
+    loop = asyncio.get_running_loop()
+    vector = await loop.run_in_executor(None, lambda: _embed_model.encode([text])[0])
+    point = PointStruct(
+        id=metadata.get("url") or metadata.get("id") or str(uuid.uuid4()),
+        vector=vector.tolist(),
+        payload={"text": text, **metadata},
+    )
+    await loop.run_in_executor(
+        None,
+        lambda: _qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=[point]),
+    )
+
+
+async def _rag_search(query: str, k: int):
+    _ensure_clients()
+    loop = asyncio.get_running_loop()
+    vector = await loop.run_in_executor(None, lambda: _embed_model.encode([query])[0])
+
+    def _search():
+        return _qdrant_client.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=vector.tolist(),
+            limit=k,
+            with_payload=True,
+        )
+
+    results = await loop.run_in_executor(None, _search)
+    matches = []
+    for r in results:
+        payload = r.payload or {}
+        matches.append(
+            {
+                "text": payload.get("text") or payload.get("content") or "",
+                "metadata": payload,
+                "score": r.score,
+            }
+        )
+    return matches
 
 SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
 
@@ -355,7 +406,13 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
                         "status": "successfully_fetched"
                     }
                     sources.append(source)
-                    
+
+                    # Vectorize and store in Qdrant
+                    try:
+                        await _upsert_text(text, source)
+                    except Exception as e:
+                        print(f"Upsert failed for {item['url']}: {e}", flush=True)
+
                     # Add to merged text with source reference
                     chunk = f"[SOURCE {source['id']}] {source['title']}\n{source['url']}\n\n{text}\n\n"
                     
@@ -383,46 +440,6 @@ async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
 
 
 @server.call_tool()
-async def rag_query(name: str, arguments: dict):
-    if name != "rag_query":
-        raise ValueError(f"Unknown tool: {name}")
-
-    query = str(arguments.get("query", "")).strip()
-    k = int(arguments.get("k", 5))
-    if not query:
-        err = {"error": "query is required"}
-        return [TextContent(type="text", text=json.dumps(err))]
-
-    global _qdrant_client, _embed_model
-    if _qdrant_client is None:
-        _qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    if _embed_model is None:
-        _embed_model = FlagModel(EMBED_MODEL_NAME, use_fp16=False)
-
-    loop = asyncio.get_running_loop()
-    vector = await loop.run_in_executor(None, lambda: _embed_model.encode([query])[0])
-
-    def _search():
-        return _qdrant_client.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=vector.tolist(),
-            limit=k,
-            with_payload=True,
-        )
-
-    results = await loop.run_in_executor(None, _search)
-    matches = []
-    for r in results:
-        payload = r.payload or {}
-        matches.append({
-            "text": payload.get("text") or payload.get("content") or "",
-            "metadata": payload,
-            "score": r.score,
-        })
-
-    return [TextContent(type="text", text=json.dumps({"matches": matches}, ensure_ascii=False))]
-
-@server.call_tool()
 async def search_and_retrieve(name: str, arguments: dict):
     if name != "search_and_retrieve":
         raise ValueError(f"Unknown tool: {name}")
@@ -442,7 +459,18 @@ async def search_and_retrieve(name: str, arguments: dict):
         }
         return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
+    k = int(arguments.get("k", 5)) if isinstance(arguments, dict) else 5
+
     result = await bulk_retrieve(args["queries"], args.get("claim"))
+
+    rag_results = {}
+    for q in args["queries"]:
+        try:
+            rag_results[q] = await _rag_search(q, k)
+        except Exception as e:
+            rag_results[q] = {"error": str(e)}
+
+    result["rag_matches"] = rag_results
 
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -451,23 +479,13 @@ async def list_tools():
     return [
         Tool(
             name="search_and_retrieve",
-            description="Bulk search and retrieve content with citation metadata. Accepts flexible query input formats.",
-            inputSchema={
-                "type": "object",
-                "additionalProperties": True,
-            },
-        ),
-        Tool(
-            name="rag_query",
-            description="Similarity search over the Qdrant cache. Args: query (str), k (int, optional).",
+            description="Search, scrape, vectorize into Qdrant, and run similarity search (RAG). Accepts flexible query formats and optional k for top matches.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
                     "k": {"type": "integer"},
                 },
-                "required": ["query"],
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
         ),
     ]
