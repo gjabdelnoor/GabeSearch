@@ -1,4 +1,5 @@
-import os, re, json, random, asyncio, aiohttp, httpx
+import os, re, json, random, asyncio, aiohttp, httpx, ast
+from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse
@@ -16,6 +17,10 @@ except Exception:  # pragma: no cover - fallback for missing config file
 
 SEARX_URL = os.getenv("SEARX_URL", "http://localhost:8888/search")
 N_QUERIES = int(os.getenv("QUERIES", "5"))
+
+STRICT_ARGS = os.getenv("STRICT_ARGS", "false").lower() == "true"
+MAX_QUERIES = int(os.getenv("MAX_QUERIES", "12"))
+LOG_ARG_WARNINGS = os.getenv("LOG_ARG_WARNINGS", "true").lower() == "true"
 
 SEARCH_ENGINES = [e.strip() for e in os.getenv("SEARCH_ENGINES", "bing,brave,qwant,mojeek,wikipedia").split(",") if e.strip()]
 
@@ -43,62 +48,134 @@ def _random_headers():
 
 server = Server("GabeSearch-mcp")
 
-def parse_queries_from_prompt(prompt: str):
-    """Extract queries from JSON or structured text"""
+CODEFENCE_RE = re.compile(r"^\s*```(?:json|yaml|yml|txt)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+JSON_ARRAY_RE = re.compile(r"\[(?:\s*\".*?\"\s*,?)+\]", re.DOTALL)
+BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+\.)\s+(.*\S)\s*$")
+KEYVAL_RE = re.compile(r"^\s*([A-Za-z_][\w\- ]{0,32})\s*:\s*(.+?)\s*$")
+
+def _strip_fences(s: str) -> str:
+    m = CODEFENCE_RE.search(s)
+    return m.group(1) if m else s
+
+def _json_try(s: str) -> Optional[Any]:
     try:
-        # Try JSON format first
-        data = json.loads(prompt)
-        if "queries" in data:
-            return data["queries"][:5], data.get("claim", prompt)
-    except json.JSONDecodeError:
+        return json.loads(s)
+    except Exception:
         pass
-    
-    # Try structured text format
-    if "QUERIES:" in prompt and "CLAIM:" in prompt:
-        queries_start = prompt.find("QUERIES:") + len("QUERIES:")
-        claim_start = prompt.find("CLAIM:")
-        
-        queries_section = prompt[queries_start:claim_start].strip()
-        claim = prompt[claim_start + len("CLAIM:"):].strip()
-        
-        queries = []
-        for line in queries_section.split('\n'):
-            line = line.strip()
-            if line and (line[0].isdigit() or line.startswith('-')):
-                query = re.sub(r'^[\d\-\.\s]+', '', line).strip()
-                if query:
-                    queries.append(query)
-        
-        return queries[:5], claim
-    
-    # Fallback: generate queries from prompt
-    return simple_queries(prompt, 3), prompt
+    try:
+        obj = ast.literal_eval(s)
+        return obj
+    except Exception:
+        return None
 
-def simple_queries(prompt: str, n: int):
-    """Fallback query generation"""
-    if 'CLAIM TO EVALUATE:' in prompt:
-        claim_start = prompt.find('CLAIM TO EVALUATE:') + len('CLAIM TO EVALUATE:')
-        claim_section = prompt[claim_start:].strip()
-        
-        if '"' in claim_section:
-            start_quote = claim_section.find('"') + 1
-            end_quote = claim_section.find('"', start_quote)
-            if end_quote > start_quote:
-                actual_claim = claim_section[start_quote:end_quote]
-            else:
-                actual_claim = claim_section[:200]
-        else:
-            actual_claim = claim_section[:200]
+def _extract_claim(text: str) -> Optional[str]:
+    for ln in text.splitlines():
+        if ln.lower().startswith("claim:"):
+            return ln.split(":", 1)[1].strip() or None
+    return None
+
+def _extract_queries_from_text(text: str) -> List[str]:
+    text = _strip_fences(text).strip()
+    qs: List[str] = []
+    obj = _json_try(text)
+    if isinstance(obj, dict) and "queries" in obj and isinstance(obj["queries"], list):
+        qs.extend([str(x) for x in obj["queries"]])
+    elif isinstance(obj, list) and all(isinstance(x, str) for x in obj):
+        qs.extend(obj)
     else:
-        actual_claim = prompt[:200]
-    
-    words = [w for w in actual_claim.lower().split() if len(w) > 3][:10]
-    if not words:
-        return [actual_claim][:n]
+        blocks = re.split(r"(?im)^\s*queries?\s*:\s*$", text)
+        if len(blocks) > 1:
+            payload = blocks[1]
+            for ln in payload.splitlines():
+                m = BULLET_RE.match(ln)
+                if m:
+                    qs.append(m.group(1).strip())
+            if not qs:
+                arr = JSON_ARRAY_RE.search(payload)
+                if arr:
+                    arr_obj = _json_try(arr.group(0))
+                    if isinstance(arr_obj, list):
+                        qs.extend([str(x) for x in arr_obj if isinstance(x, str)])
+        if not qs:
+            for ln in text.splitlines():
+                m = BULLET_RE.match(ln)
+                if m:
+                    qs.append(m.group(1).strip())
+        if not qs:
+            for ln in text.splitlines():
+                m = KEYVAL_RE.match(ln)
+                if m:
+                    k = m.group(1).strip().lower()
+                    if k in {"q", "query", "search", "prompt"}:
+                        qs.append(m.group(2).strip())
+        if not qs:
+            lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 3]
+            if 1 <= len(lines) <= 20:
+                qs.extend(lines)
+    return qs
 
-    chunk_size = max(1, len(words) // n)
-    queries = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-    return queries[:n]
+def normalize_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(args.get("queries"), list) and all(isinstance(x, str) for x in args["queries"]):
+        queries = [x.strip() for x in args["queries"] if str(x).strip()]
+        claim = str(args.get("claim")).strip() if isinstance(args.get("claim"), str) else None
+        if LOG_ARG_WARNINGS:
+            print("normalize_args: direct queries provided", flush=True)
+    elif any(k in args for k in ("query", "q", "search", "searches", "questions")):
+        key = next(k for k in ("query", "q", "search", "searches", "questions") if k in args)
+        v = args[key]
+        if isinstance(v, list):
+            queries = [str(x).strip() for x in v if str(x).strip()]
+        else:
+            queries = [str(v).strip()]
+        claim = str(args.get("claim")).strip() if isinstance(args.get("claim"), str) else None
+        if LOG_ARG_WARNINGS:
+            print(f"normalize_args: used alias '{key}'", flush=True)
+    else:
+        text_fields = []
+        for k in ("prompt", "input", "body", "data", "text"):
+            v = args.get(k)
+            if isinstance(v, str) and v.strip():
+                text_fields.append(v)
+        if isinstance(args, str):
+            text_fields.append(args)
+        queries, claim = [], None
+        for t in text_fields:
+            t = _strip_fences(t)
+            obj = _json_try(t)
+            if isinstance(obj, dict) and "queries" in obj:
+                if isinstance(obj["queries"], list):
+                    queries.extend([str(x) for x in obj["queries"]])
+                if not claim and isinstance(obj.get("claim"), str):
+                    claim = obj["claim"].strip() or None
+                if LOG_ARG_WARNINGS:
+                    print("normalize_args: parsed JSON object", flush=True)
+            if not queries:
+                extracted = _extract_queries_from_text(t)
+                if extracted and LOG_ARG_WARNINGS:
+                    print("normalize_args: extracted queries from text", flush=True)
+                queries.extend(extracted)
+            if not claim:
+                claim = _extract_claim(t)
+        if not queries and STRICT_ARGS:
+            raise ValueError("No queries found. Provide at least one search query.")
+    queries = [q.strip() for q in queries if q and isinstance(q, str)]
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for q in queries:
+        if q not in seen:
+            uniq.append(q)
+            seen.add(q)
+    if len(uniq) == 0:
+        raise ValueError("No queries found. Provide at least one search query.")
+    if len(uniq) > MAX_QUERIES:
+        if LOG_ARG_WARNINGS:
+            print(f"normalize_args: clipping queries to {MAX_QUERIES}", flush=True)
+        uniq = uniq[:MAX_QUERIES]
+    uniq = [re.sub(r"\s+", " ", q) for q in uniq]
+    out: Dict[str, Any] = {"queries": uniq}
+    if claim:
+        out["claim"] = claim
+    return out
 
 async def searx_top_links(query: str, k: int):
     """Get search results with randomized headers and engine rotation."""
@@ -222,9 +299,8 @@ async def fetch_page_with_metadata(url: str, client: httpx.AsyncClient):
     
     return "", {}
 
-async def bulk_retrieve(prompt: str):
-    queries, claim = parse_queries_from_prompt(prompt)
-    print(f"DEBUG: Parsed {len(queries)} queries: {queries}", flush=True)
+async def bulk_retrieve(queries: List[str], claim: Optional[str] = None):
+    print(f"DEBUG: Using {len(queries)} queries: {queries}", flush=True)
     
     # Search all queries in parallel
     search_tasks = [searx_top_links(q, TOP_K) for q in queries]
@@ -299,10 +375,24 @@ async def bulk_retrieve(prompt: str):
 async def search_and_retrieve(name: str, arguments: dict):
     if name != "search_and_retrieve":
         raise ValueError(f"Unknown tool: {name}")
-    
-    prompt = arguments.get("prompt", "")
-    result = await bulk_retrieve(prompt)
-    
+
+    try:
+        args = normalize_args(arguments if isinstance(arguments, dict) else {"prompt": str(arguments)})
+    except Exception as e:
+        err = {
+            "error": f"Argument parsing failed: {e}",
+            "hint": {
+                "expected": {"queries": ["..."], "claim": "optional"},
+                "examples": [
+                    {"queries": ["ant pheromones 2024", "mosquito saliva proteome 2025"]},
+                    {"prompt": "QUERIES:\n- ant pheromones 2024\n- mosquito saliva proteome 2025\nCLAIM: find OA reviews"},
+                ],
+            },
+        }
+        return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+    result = await bulk_retrieve(args["queries"], args.get("claim"))
+
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 @server.list_tools()
@@ -310,16 +400,10 @@ async def list_tools():
     return [
         Tool(
             name="search_and_retrieve",
-            description="Bulk search and retrieve content with citation metadata. Accepts JSON with 'queries' array or structured text format.",
+            description="Bulk search and retrieve content with citation metadata. Accepts flexible query input formats.",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "JSON object with queries array, or structured text with QUERIES: and CLAIM: sections"
-                    }
-                },
-                "required": ["prompt"],
+                "additionalProperties": True,
             },
         )
     ]
